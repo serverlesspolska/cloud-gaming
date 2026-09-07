@@ -1,0 +1,19 @@
+{
+    "apps": [
+        {
+            "allow-client-commands": false,
+            "image-path": "desktop.png",
+            "name": "Desktop",
+            "virtual-display": true
+        },
+        {
+            "detached": [ "steam://open/bigpicture" ],
+            "image-path": "steam.png",
+            "name": "Steam Big Picture",
+            "prep-cmd": [ { "do": "", "elevated": false, "undo": "steam://close/bigpicture" } ],
+            "virtual-display": true
+        }
+    ],
+    "env": {},
+    "version": 2
+}

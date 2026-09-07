@@ -1,0 +1,33 @@
+{
+  "agent": {
+    "metrics_collection_interval": 60
+  },
+  "metrics": {
+    "namespace": "CWAgent",
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}"
+    },
+    "metrics_collected": {
+      "Memory": {
+        "measurement": [
+          "Available MBytes",
+          "% Committed Bytes In Use"
+        ],
+        "metrics_collection_interval": 60
+      },
+      "LogicalDisk": {
+        "measurement": [
+          "% Free Space",
+          "Free Megabytes"
+        ],
+        "resources": ["C:"],
+        "metrics_collection_interval": 300
+      },
+      "Processor": {
+        "measurement": ["% Processor Time"],
+        "resources": ["_Total"],
+        "metrics_collection_interval": 60
+      }
+    }
+  }
+}

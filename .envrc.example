@@ -1,0 +1,25 @@
+# Configuration for the gaming rig scripts. Setup (one-time):
+#   cp .envrc.example .envrc
+#   edit .envrc with your values
+#   direnv allow          # or: source .envrc (without direnv)
+# .envrc is gitignored — never commit real values.
+
+# Windows Administrator password == Apollo web UI password.
+# Constraint: min 8 chars with uppercase, lowercase, digit, and a special character,
+# where the ONLY allowed special characters are: @$!%*?&
+# Keep the single quotes: '$' inside double quotes would be expanded by the shell.
+export ADMIN_PASSWORD='change-me'
+
+# Alternative: keep the password off disk entirely via macOS Keychain:
+#   one-time store:  security add-generic-password -s apollo-gaming -a admin -w
+#   then use:        export ADMIN_PASSWORD="$(security find-generic-password -s apollo-gaming -w)"
+
+# Optional — every value below has a working default:
+# export AWS_PROFILE=""               # AWS CLI profile (SSO, access keys — any style works)
+# export AWS_REGION="eu-central-1"    # region for the stack (default: your CLI config, else eu-central-1)
+# export STACK_NAME="apollo-gaming"
+# export INSTANCE_TYPE="g6.2xlarge"   # or g6.xlarge
+# export VOLUME_SIZE="100"            # GB; size up for your game library
+# export AZ=""                        # default: first AZ that offers the instance type
+# export AUTO_STOP_TIMEZONE="UTC"     # IANA name for the daily 02:00 auto-stop, e.g. Europe/Berlin
+# export IMAGE_ID=""                  # explicit AMI override — see "Updating" in README before use!

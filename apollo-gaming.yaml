@@ -1,0 +1,646 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Cloud gaming rig on EC2 g6 (NVIDIA L4) with Windows Server 2022.
+  Streaming stack: Apollo (Sunshine fork with built-in SudoVDA virtual display) + Moonlight/Artemis clients.
+  Based on aws-samples/cloud-gaming-on-ec2-using-steam (MIT-0).
+
+Parameters:
+  imageId:
+    Description: >-
+      Windows Server 2022 Full Base AMI. deploy-apollo.sh resolves the latest AMI on the first
+      deploy and pins the same value on every later deploy. WARNING - a changed imageId REPLACES
+      the instance and deletes its disk, installed games included.
+    Type: AWS::EC2::Image::Id
+
+  ec2Name:
+    Type: String
+    Description: EC2 instance name
+    Default: Apollo-GAMING
+
+  instanceType:
+    Description: Instance type (g6 = NVIDIA L4 24GB; 2xlarge = 8 vCPU / 32 GB, recommended for 4K)
+    Type: String
+    AllowedValues:
+      - g6.xlarge
+      - g6.2xlarge
+    Default: g6.2xlarge
+
+  vpcCidr:
+    Type: String
+    Description: CIDR block for the VPC
+    Default: 10.0.0.0/16
+    AllowedPattern: "^\\d+\\.\\d+\\.\\d+\\.\\d+\\/\\d+$"
+  subnetCidr:
+    Type: String
+    Description: CIDR block for the public subnet
+    Default: 10.0.1.0/24
+    AllowedPattern: "^\\d+\\.\\d+\\.\\d+\\.\\d+\\/\\d+$"
+  availabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone for the subnet (deploy-apollo.sh picks one that offers the instance type)
+
+  administratorPassword:
+    Type: String
+    Description: Password for the Administrator account
+    NoEcho: true
+    MinLength: 8
+    AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)(?=.*[@$!%*?&])[A-Za-z\\d@$!%*?&]{8,}$"
+    ConstraintDescription: Min 8 chars with uppercase, lowercase, number, and special character (@$!%*?&)
+
+  ingressIPv4:
+    Type: String
+    Description: Allowed source IP for RDP + streaming (e.g. 1.2.3.4/32, see https://checkip.amazonaws.com)
+    AllowedPattern: "^\\d+\\.\\d+\\.\\d+\\.\\d+\\/\\d+$"
+    ConstraintDescription: Specify valid IPv4 prefix
+    Default: 0.0.0.0/32
+
+  volumeSize:
+    Type: Number
+    Description: Volume size in GiB
+    MinValue: 30
+    MaxValue: 16384
+    Default: 100
+  volumeType:
+    Type: String
+    AllowedValues: ["gp3", "gp2"]
+    Default: "gp3"
+
+  autoStopTimezone:
+    Type: String
+    Description: IANA time zone for the daily 02:00 auto-stop (for example Europe/Berlin)
+    Default: UTC
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref vpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VPC"
+        - Key: StackName
+          Value: !Sub ${AWS::StackName}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-IGW"
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref availabilityZone
+      CidrBlock: !Ref subnetCidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicSubnet"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicRT"
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  securityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDP + Apollo/Moonlight streaming, restricted to the allowed source IP
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: RDP (IPv4)
+          IpProtocol: "tcp"
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Ref ingressIPv4
+        - Description: Apollo HTTPS/HTTP/WebUI (47984-47990)
+          IpProtocol: "tcp"
+          FromPort: 47984
+          ToPort: 47990
+          CidrIp: !Ref ingressIPv4
+        - Description: Apollo RTSP (48010)
+          IpProtocol: "tcp"
+          FromPort: 48010
+          ToPort: 48010
+          CidrIp: !Ref ingressIPv4
+        - Description: Apollo UDP (video/control/audio)
+          IpProtocol: "udp"
+          FromPort: 47984
+          ToPort: 48010
+          CidrIp: !Ref ingressIPv4
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic (IPv4)
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "[${AWS::StackName}] - ${ec2Name}"
+        - Key: StackName
+          Value: !Sub ${AWS::StackName}
+
+  instanceIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Path: /
+      Policies:
+        - PolicyName: gpuDrivers
+          PolicyDocument: # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nvidia-gaming-driver.html
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::nvidia-gaming"
+                  - !Sub "arn:${AWS::Partition}:s3:::nvidia-gaming/*"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        # CloudWatch agent (RAM/disk metrics) + custom GPU metrics via PutMetricData
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy"
+      Tags:
+        - Key: StackName
+          Value: !Sub ${AWS::StackName}
+
+  instanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref instanceIamRole
+
+  Ec2InstanceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 1
+          HttpTokens: required
+
+  ec2Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT90M
+    Metadata:
+      Comment: NVIDIA gaming driver 610.x + Apollo streaming host
+      AWS::CloudFormation::Init:
+        configSets:
+          setup:
+            - config1
+            - config2
+            - config3
+        config1:
+          files:
+            c:\\windows\\temp\\setup.ps1:
+              content: !Sub |
+                $markerFile = "C:\windows\temp\setup_completed.marker"
+                if (-not (Test-Path $markerFile)) {
+                Start-Transcript -Path "C:\windows\temp\setup-transcript.txt" -Append
+                $ErrorActionPreference = "Continue"
+                [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+                # --- Administrator password + autologon (a real desktop session must exist for games) ---
+                Write-Output "** Setting Administrator password and autologon"
+                net user Administrator '${administratorPassword}'
+                $winlogon = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+                Set-ItemProperty -Path $winlogon -Name AutoAdminLogon -Value "1" -Type String
+                Set-ItemProperty -Path $winlogon -Name DefaultUserName -Value "Administrator" -Type String
+                Set-ItemProperty -Path $winlogon -Name DefaultPassword -Value '${administratorPassword}' -Type String
+                Set-ItemProperty -Path $winlogon -Name DefaultDomainName -Value "." -Type String
+
+                # --- Windows Media Foundation (required for media/game playback on Server) ---
+                Write-Output "** Installing Windows Media Foundation"
+                Install-WindowsFeature Server-Media-Foundation
+
+                # --- Audio service (off by default on Windows Server) ---
+                Write-Output "** Enabling audio service"
+                New-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name "ServicesPipeTimeout" -Value 600000 -PropertyType "DWord" -Force | Out-Null
+                Set-Service -Name audiosrv -StartupType Automatic
+                Start-Service -Name audiosrv
+
+                # --- NVIDIA gaming driver (latest Cloud Gaming build from the AWS bucket; supports L4/g6 + Windows Server 2022) ---
+                # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nvidia-gaming-driver.html
+                Write-Output "** Downloading NVIDIA gaming driver from s3://nvidia-gaming/windows/latest"
+                $Bucket = "nvidia-gaming"
+                $KeyPrefix = "windows/latest"
+                $LocalPath = "C:\windows\temp\nvidia-driver"
+                $Objects = Get-S3Object -BucketName $Bucket -KeyPrefix $KeyPrefix -Region us-east-1
+                foreach ($Object in $Objects) {
+                    $LocalFileName = $Object.Key
+                    if ($LocalFileName -ne '' -and $Object.Size -ne 0) {
+                        $LocalFilePath = Join-Path $LocalPath ($LocalFileName -replace '/', '\')
+                        Copy-S3Object -BucketName $Bucket -Key $Object.Key -LocalFile $LocalFilePath -Region us-east-1
+                    }
+                }
+                $installer = Get-ChildItem -Path $LocalPath -Recurse -Filter *.exe | Select-Object -First 1
+                if ($null -eq $installer) {
+                    $zip = Get-ChildItem -Path $LocalPath -Recurse -Filter *.zip | Select-Object -First 1
+                    if ($zip) {
+                        Expand-Archive -Path $zip.FullName -DestinationPath "$LocalPath\extracted" -Force
+                        $installer = Get-ChildItem -Path "$LocalPath\extracted" -Recurse -Filter *.exe | Select-Object -First 1
+                    }
+                }
+                Write-Output "** Installing NVIDIA driver: $($installer.FullName)"
+                $ExitCode = (Start-Process -FilePath $installer.FullName -ArgumentList "/s","/clean","/noreboot" -NoNewWindow -Wait -PassThru).ExitCode
+                Write-Output "** NVIDIA driver installer exit code: $ExitCode"
+
+                # Registry key for driver 527.27+ (license activation)
+                reg add "HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global" /v vGamingMarketplace /t REG_DWORD /d 2 /f
+                # Cert for driver 591.59+ (2026_03_02) - the old 2023/2024 certs do NOT license driver 610.x
+                Invoke-WebRequest -Uri "https://nvidia-gaming.s3.amazonaws.com/GridSwCert-Archive/GridSwCert_2026_03_02.cert" -OutFile "$Env:PUBLIC\Documents\GridSwCert.txt"
+
+                # --- VB-Cable virtual audio device (Apollo needs an audio endpoint on a headless server) ---
+                Write-Output "** Installing VB-Cable"
+                Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" -OutFile "C:\windows\temp\VBCABLE_Driver_Pack43.zip"
+                Expand-Archive -Path "C:\windows\temp\VBCABLE_Driver_Pack43.zip" -DestinationPath "C:\windows\temp\VBCABLE_Driver_Pack43"
+                $pathToCatFile = "C:\windows\temp\VBCABLE_Driver_Pack43\vbaudio_cable64_win7.cat"
+                $FullCertificateExportPath = "C:\windows\temp\VBCABLE_Driver_Pack43\VBCert.cer"
+                $VB = @{}
+                $VB.DriverFile = $pathToCatFile
+                $VB.CertName = $FullCertificateExportPath
+                $VB.ExportType = [System.Security.Cryptography.X509Certificates.X509ContentType]::Cert
+                $VB.Cert = (Get-AuthenticodeSignature -filepath $VB.DriverFile).SignerCertificate
+                [System.IO.File]::WriteAllBytes($VB.CertName, $VB.Cert.Export($VB.ExportType))
+                Import-Certificate -CertStoreLocation Cert:\LocalMachine\TrustedPublisher -FilePath $VB.CertName | Out-Null
+                Start-Process -FilePath "C:\windows\temp\VBCABLE_Driver_Pack43\VBCABLE_Setup_x64.exe" -ArgumentList "-i","-h" -NoNewWindow -Wait
+
+                # --- Chocolatey ---
+                Write-Output "** Installing Chocolatey"
+                $chocoScript = (New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1')
+                Invoke-Command -ScriptBlock ([ScriptBlock]::Create($chocoScript))
+                $env:Path += ";$env:AllUsersProfile\chocolatey\bin"
+
+                # --- Runtimes ---
+                Write-Output "** Installing VC++ Redistributable and WebView2"
+                choco install --no-progress -y vcredist140
+                choco install --no-progress -y webview2-runtime
+
+                # --- ViGEmBus (virtual gamepad; 1.17.333 is the last version that installs on Windows Server) ---
+                Write-Output "** Installing ViGEmBus"
+                choco install vigembus --version=1.17.333 -y --no-progress
+
+                # --- Game launchers ---
+                Write-Output "** Installing Steam"
+                Invoke-WebRequest -Uri "https://steamcdn-a.akamaihd.net/client/installer/SteamSetup.exe" -OutFile "C:\windows\temp\SteamSetup.exe"
+                Start-Process -FilePath "C:\windows\temp\SteamSetup.exe" -ArgumentList "/S" -Wait
+                Write-Output "** Installing GOG Galaxy"
+                choco install --no-progress -y goggalaxy
+                Write-Output "** Installing Google Chrome"
+                choco install --no-progress -y googlechrome
+
+                # --- Apollo (Sunshine fork with built-in SudoVDA virtual display for headless streaming) ---
+                Write-Output "** Installing Apollo"
+                Invoke-WebRequest -Uri "https://github.com/ClassicOldSong/Apollo/releases/download/v0.4.6/Apollo-0.4.6.exe" -OutFile "C:\windows\temp\Apollo-0.4.6.exe"
+                $ExitCode = (Start-Process -FilePath "C:\windows\temp\Apollo-0.4.6.exe" -ArgumentList "/S" -NoNewWindow -Wait -PassThru).ExitCode
+                Write-Output "** Apollo installer exit code: $ExitCode"
+                # Headless streaming config:
+                # - wan: web UI must be reachable from public IP (SG restricts to home IP, login still required)
+                # - headless_mode + isolation: machine has no physical monitor, only the virtual display counts
+                Write-Output "** Writing Apollo headless config"
+                $apolloConf = "C:\Program Files\Apollo\config\sunshine.conf"
+                Add-Content -Path $apolloConf -Value "origin_web_ui_allowed = wan"
+                Add-Content -Path $apolloConf -Value "headless_mode = enabled"
+                Add-Content -Path $apolloConf -Value "isolated_virtual_display_option = enabled"
+                # av1_mode 3 = advertise AV1 Main 8-bit AND 10-bit/HDR (L4 NVENC supports both).
+                # Note the counterintuitive scale: 0 = auto-detect, 1 = do NOT advertise AV1.
+                Add-Content -Path $apolloConf -Value "av1_mode = 3"
+                # ensure_only_display: activate the captured display and disable all others for the
+                # session. Without it the NVIDIA driver's phantom 1280x800 head keeps origin (0,0) and
+                # therefore stays primary, so fullscreen games launch on the phantom while Apollo
+                # captures the virtual display - client sees only the desktop and hears game audio.
+                Add-Content -Path $apolloConf -Value "dd_configuration_option = ensure_only_display"
+                # virtual-display=true is what makes Apollo create a SudoVDA monitor at the client's
+                # resolution and force capture onto it - without it Apollo captures the NVIDIA driver's
+                # phantom 1280x800 head and 4K never applies.
+                # Written unconditionally: at setup time Apollo has not started yet, so its default
+                # apps.json does not exist - a Test-Path-guarded patch would silently no-op on fresh
+                # deploys. Custom tiles are layered on top afterwards via apply-config.sh
+                # (config/apps.json in the repo).
+                Write-Output "** Writing default Apollo apps.json (virtual display enabled)"
+                $appsFile = "C:\Program Files\Apollo\config\apps.json"
+                $appsJson = @'
+                {
+                    "apps": [
+                        {
+                            "allow-client-commands": false,
+                            "image-path": "desktop.png",
+                            "name": "Desktop",
+                            "virtual-display": true
+                        },
+                        {
+                            "detached": [ "steam://open/bigpicture" ],
+                            "image-path": "steam.png",
+                            "name": "Steam Big Picture",
+                            "prep-cmd": [ { "do": "", "elevated": false, "undo": "steam://close/bigpicture" } ],
+                            "virtual-display": true
+                        }
+                    ],
+                    "env": {},
+                    "version": 2
+                }
+                '@
+                Set-Content -Path $appsFile -Value $appsJson -Encoding UTF8
+                # Firewall rules for Apollo/Moonlight
+                New-NetFirewallRule -DisplayName "Apollo TCP" -Direction Inbound -Protocol TCP -LocalPort 47984-47990,48010 -Action Allow -Profile Any
+                New-NetFirewallRule -DisplayName "Apollo UDP" -Direction Inbound -Protocol UDP -LocalPort 47984-48010 -Action Allow -Profile Any
+
+                # --- RDP-to-console fix: return session to console when RDP disconnects ---
+                $taskXml = @"
+                <?xml version="1.0" encoding="UTF-16"?>
+                <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+                    <RegistrationInfo><Date>2024-03-16T00:27:45</Date><Author>Administrator</Author><URI>\na</URI></RegistrationInfo>
+                    <Triggers>
+                    <EventTrigger>
+                        <Enabled>true</Enabled>
+                        <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"&gt;&lt;Select Path="Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"&gt;*[System[Provider[@Name='Microsoft-Windows-TerminalServices-LocalSessionManager'] and EventID=24]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+                    </EventTrigger>
+                    </Triggers>
+                    <Principals>
+                    <Principal id="Author"><UserId>SYSTEM</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal>
+                    </Principals>
+                    <Settings>
+                    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+                    <AllowHardTerminate>true</AllowHardTerminate>
+                    <StartWhenAvailable>false</StartWhenAvailable>
+                    <AllowStartOnDemand>true</AllowStartOnDemand>
+                    <Enabled>true</Enabled>
+                    <ExecutionTimeLimit>PT72H</ExecutionTimeLimit>
+                    </Settings>
+                    <Actions Context="Author">
+                    <Exec>
+                        <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
+                        <Arguments>-ExecutionPolicy Bypass -File "C:\windows\Scripts\SwitchToConsole.ps1"</Arguments>
+                    </Exec>
+                    </Actions>
+                </Task>
+                "@
+                Register-ScheduledTask -Xml $taskXml -TaskName "SwitchToConsole"
+
+                New-Item -ItemType file -Path $markerFile -Force
+                Stop-Transcript
+                } else {
+                Write-Output "Setup already completed. Skipping."
+                }
+            c:\\windows\\temp\\postinstall.ps1:
+              content: !Sub |
+                Start-Transcript -Path "C:\windows\temp\postinstall-transcript.txt" -Append
+                $ErrorActionPreference = "Continue"
+
+                # Disable non-NVIDIA display adapters so desktop + games render on the L4
+                # (never touch SudoMaker/SudoVDA - that is Apollo's virtual display adapter)
+                Write-Output "** Disabling non-NVIDIA display adapters"
+                Get-PnpDevice -Class "Display" -Status OK | Where-Object { $_.Name -notmatch "nvidia|SudoMaker|SudoVDA" } | Disable-PnpDevice -Confirm:$false
+                Start-Sleep -Seconds 5
+
+                # Web UI credentials must be set AFTER the first service start (the first start
+                # regenerates state and wipes creds set during initial setup), with the service stopped.
+                # The final Start-Service also re-runs the encoder probe on the finished adapter layout,
+                # so NVENC is detected instead of the software x264 fallback.
+                $svc = Get-Service | Where-Object { $_.Name -match "Apollo|Sunshine" } | Select-Object -First 1
+                if ($svc) {
+                    Write-Output "** Streaming service found: $($svc.Name), status: $($svc.Status)"
+                    Set-Service -Name $svc.Name -StartupType Automatic
+                    Stop-Service -Name $svc.Name -ErrorAction SilentlyContinue
+                    Write-Output "** Setting Apollo web UI credentials (user: admin)"
+                    Start-Process -FilePath "C:\Program Files\Apollo\sunshine.exe" -ArgumentList "--creds","admin",'${administratorPassword}' -NoNewWindow -Wait
+                    Start-Service -Name $svc.Name
+                } else {
+                    Write-Output "** WARNING: no Apollo/Sunshine service found!"
+                }
+
+                # Write GPU/driver verification report
+                $smi = Get-ChildItem -Path "C:\Windows\System32\DriverStore\FileRepository" -Recurse -Filter "nvidia-smi.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($smi) {
+                    & $smi.FullName -q | Out-File -FilePath "C:\windows\temp\nvidia-verification.txt"
+                    & $smi.FullName | Out-File -FilePath "C:\windows\temp\nvidia-verification.txt" -Append
+                } else {
+                    Write-Output "** WARNING: nvidia-smi.exe not found - driver install likely failed"
+                }
+                Stop-Transcript
+            c:\\windows\\Scripts\\SwitchToConsole.ps1:
+              content: |
+                $connectionEventLogName = "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
+                $connectionQuery = @"
+                    <QueryList>
+                        <Query Path="$connectionEventLogName">
+                            <Select Path="$connectionEventLogName">*[System[Provider[@Name='Microsoft-Windows-TerminalServices-RemoteConnectionManager'] and EventID=1149]]</Select>
+                        </Query>
+                    </QueryList>
+                "@
+                $timeThreshold = (Get-Date).AddSeconds(-3)
+                $recentConnectionEvents = Get-WinEvent -FilterXml $connectionQuery | Where-Object {$_.TimeCreated -ge $timeThreshold}
+                if (-not $recentConnectionEvents) {
+                    $eventLogName = "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"
+                $query = @"
+                    <QueryList>
+                        <Query Path="$eventLogName">
+                            <Select Path="$eventLogName">*[System[Provider[@Name='Microsoft-Windows-TerminalServices-LocalSessionManager'] and EventID=24]]</Select>
+                        </Query>
+                    </QueryList>
+                "@
+                    $latestEvent = Get-WinEvent -FilterXml $query -MaxEvents 1
+                    $sessionID = $latestEvent.Properties[1].Value
+                    Start-Process -FilePath "tscon.exe" -ArgumentList "$sessionID /dest:console" -NoNewWindow -Wait
+                }
+            c:\\Users\\Administrator\\Desktop\\end_rdp_session.cmd:
+              content: |
+                @echo off
+                tscon %sessionname% /dest:console
+        config2:
+          commands:
+            0-setup:
+              command: powershell.exe -ExecutionPolicy Unrestricted C:\windows\temp\setup.ps1
+              ignoreErrors: true
+              waitAfterCompletion: '0'
+            02-restart:
+              command: powershell.exe -Command Restart-Computer
+              waitAfterCompletion: forever
+        config3:
+          commands:
+            03-post-install:
+              command: powershell.exe -ExecutionPolicy Unrestricted C:\windows\temp\postinstall.ps1
+              ignoreErrors: true
+              waitAfterCompletion: '0'
+            04-signal-resource:
+              command: !Sub >
+                cfn-signal.exe -e %ERRORLEVEL% --resource ec2Instance --stack ${AWS::StackName} --region ${AWS::Region}
+    Properties:
+      ImageId: !Ref imageId
+      InstanceType: !Ref instanceType
+      IamInstanceProfile: !Ref instanceProfile
+      SubnetId: !Ref PublicSubnet
+      Monitoring: true
+      DisableApiTermination: false
+      SecurityGroupIds:
+        - !Ref securityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: !Ref volumeType
+            VolumeSize: !Ref volumeSize
+            DeleteOnTermination: true
+            Encrypted: true
+      LaunchTemplate:
+        LaunchTemplateId: !Ref 'Ec2InstanceLaunchTemplate'
+        Version: !GetAtt 'Ec2InstanceLaunchTemplate.LatestVersionNumber'
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          cfn-init.exe -v --stack ${AWS::StackId} --resource ec2Instance --region ${AWS::Region} --configsets setup
+          </powershell>
+      Tags:
+        - Key: Name
+          Value: !Ref ec2Name
+        - Key: StackName
+          Value: !Sub ${AWS::StackName}
+
+  elasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      NetworkBorderGroup: !Ref AWS::Region
+      InstanceId: !Ref ec2Instance
+      Tags:
+        - Key: Name
+          Value: !Sub "[${AWS::StackName}] - ${ec2Name}"
+        - Key: StackName
+          Value: !Sub ${AWS::StackName}
+
+  # Daily shutdown at 02:00 (autoStopTimezone) to save costs
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StopEC2Instance
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${ec2Instance}"
+      Tags:
+        - Key: StackName
+          Value: !Sub ${AWS::StackName}
+
+  DailyShutdownSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-daily-shutdown"
+      Description: Stop the gaming EC2 instance daily at 02:00 (autoStopTimezone)
+      ScheduleExpression: "cron(0 2 * * ? *)"
+      ScheduleExpressionTimezone: !Ref autoStopTimezone
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: ENABLED
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:stopInstances
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+        Input: !Sub '{"InstanceIds": ["${ec2Instance}"]}'
+
+  # Daily EBS snapshots with 30-day retention
+  DLMLifecycleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dlm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
+      Tags:
+        - Key: StackName
+          Value: !Sub ${AWS::StackName}
+
+  DailySnapshotPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Properties:
+      Description: Daily snapshots for gaming EC2 instance with 30-day retention
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt DLMLifecycleRole.Arn
+      PolicyDetails:
+        ResourceTypes:
+          - INSTANCE
+        TargetTags:
+          - Key: StackName
+            Value: !Sub ${AWS::StackName}
+        Schedules:
+          - Name: DailySnapshot
+            CreateRule:
+              Interval: 24
+              IntervalUnit: HOURS
+              Times:
+                - "03:00"
+            RetainRule:
+              Count: 30
+            CopyTags: true
+        PolicyType: EBS_SNAPSHOT_MANAGEMENT
+      Tags:
+        - Key: StackName
+          Value: !Sub ${AWS::StackName}
+
+Outputs:
+  ElasticIP:
+    Description: Static public IP - use this in Moonlight to connect
+    Value: !Ref elasticIP
+
+  ApolloWebUI:
+    Description: Apollo web UI (user admin / your admin password) - used for PIN pairing with Moonlight
+    Value: !Sub "https://${elasticIP}:47990"
+
+  SSMsessionManager:
+    Description: SSM Session Manager
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${ec2Instance}"
+
+  RDPconnect:
+    Description: RDP access via Fleet Manager
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/systems-manager/managed-instances/rdp-connect?region=${AWS::Region}&instances=${ec2Instance}"
+
+  EC2console:
+    Description: EC2 console
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/ec2/home?region=${AWS::Region}#Instances:search=${ec2Instance}"

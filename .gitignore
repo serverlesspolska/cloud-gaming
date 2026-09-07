@@ -1,0 +1,4 @@
+config/live/
+.envrc
+.env
+.env.local
